@@ -1,422 +1,516 @@
 export default class QrScanner {
-    /* async */
-    static hasCamera() {
-        if (!navigator.mediaDevices) return Promise.resolve(false);
-        // note that enumerateDevices can always be called and does not prompt the user for permission. However, device
-        // labels are only readable if served via https and an active media stream exists or permanent permission is
-        // given. That doesn't matter for us though as we don't require labels.
-        return navigator.mediaDevices.enumerateDevices()
-            .then(devices => devices.some(device => device.kind === 'videoinput'))
-            .catch(() => false);
+  /* async */
+  static hasCamera() {
+    if (!navigator.mediaDevices) return Promise.resolve(false);
+    // note that enumerateDevices can always be called and does not prompt the user for permission. However, device
+    // labels are only readable if served via https and an active media stream exists or permanent permission is
+    // given. That doesn't matter for us though as we don't require labels.
+    return navigator.mediaDevices
+      .enumerateDevices()
+      .then((devices) => devices.some((device) => device.kind === "videoinput"))
+      .catch(() => false);
+  }
+
+  constructor(
+    video,
+    onDecode,
+    canvasSizeOrOnDecodeError = this._onDecodeError.bind(this),
+    canvasSize = QrScanner.DEFAULT_CANVAS_SIZE,
+    preferredFacingMode = "environment"
+  ) {
+    this.$video = video;
+    this.$canvas = document.createElement("canvas");
+    this._onDecode = onDecode;
+    this._preferredFacingMode = preferredFacingMode;
+    this._active = false;
+    this._paused = false;
+    this._flashOn = false;
+
+    if (typeof canvasSizeOrOnDecodeError === "number") {
+      // legacy function signature where canvas size is the third argument
+      canvasSize = canvasSizeOrOnDecodeError;
+      console.warn(
+        "You're using a deprecated version of the QrScanner constructor which will be removed in " +
+          "the future"
+      );
+    } else {
+      this._onDecodeError = canvasSizeOrOnDecodeError;
     }
 
-    constructor(
-        video,
-        onDecode,
-        canvasSizeOrOnDecodeError = this._onDecodeError.bind(this),
-        canvasSize = QrScanner.DEFAULT_CANVAS_SIZE,
-        preferredFacingMode = 'environment'
-    ) {
-        this.$video = video;
-        this.$canvas = document.createElement('canvas');
-        this._onDecode = onDecode;
-        this._preferredFacingMode = preferredFacingMode;
-        this._active = false;
-        this._paused = false;
-        this._flashOn = false;
+    this.$canvas.width = canvasSize;
+    this.$canvas.height = canvasSize;
+    this._sourceRect = {
+      x: 0,
+      y: 0,
+      width: canvasSize,
+      height: canvasSize,
+    };
 
-        if (typeof canvasSizeOrOnDecodeError === 'number') {
-            // legacy function signature where canvas size is the third argument
-            canvasSize = canvasSizeOrOnDecodeError;
-            console.warn('You\'re using a deprecated version of the QrScanner constructor which will be removed in '
-                + 'the future');
+    this._onPlay = this._onPlay.bind(this);
+    this._onVisibilityChange = this._onVisibilityChange.bind(this);
+
+    // Allow inline playback on iPhone instead of requiring full screen playback,
+    // see https://webkit.org/blog/6784/new-video-policies-for-ios/
+    this.$video.playsInline = true;
+    // Allow play() on iPhone without requiring a user gesture. Should not really be needed as camera stream
+    // includes no audio, but just to be safe.
+    this.$video.muted = true;
+    this.$video.disablePictureInPicture = true;
+    this.$video.addEventListener("play", this._onPlay);
+    document.addEventListener("visibilitychange", this._onVisibilityChange);
+
+    this._qrWorker = new Worker(QrScanner.WORKER_PATH);
+  }
+
+  /* async */
+  hasFlash() {
+    if (!("ImageCapture" in window)) {
+      return Promise.resolve(false);
+    }
+
+    const track = this.$video.srcObject
+      ? this.$video.srcObject.getVideoTracks()[0]
+      : null;
+    if (!track) {
+      return Promise.reject("Camera not started or not available");
+    }
+
+    const imageCapture = new ImageCapture(track);
+    return imageCapture
+      .getPhotoCapabilities()
+      .then((result) => {
+        return result.fillLightMode.includes("flash");
+      })
+      .catch((error) => {
+        console.warn(error);
+        return false;
+      });
+  }
+
+  isFlashOn() {
+    return this._flashOn;
+  }
+
+  /* async */
+  toggleFlash() {
+    return this._setFlash(!this._flashOn);
+  }
+
+  /* async */
+  turnFlashOff() {
+    return this._setFlash(false);
+  }
+
+  /* async */
+  turnFlashOn() {
+    return this._setFlash(true);
+  }
+
+  destroy() {
+    this.$video.removeEventListener("play", this._onPlay);
+    document.removeEventListener("visibilitychange", this._onVisibilityChange);
+
+    this.stop();
+    this._qrWorker.postMessage({
+      type: "close",
+    });
+  }
+
+  /* async */
+  start() {
+    if (this._active && !this._paused) {
+      return Promise.resolve();
+    }
+    if (window.location.protocol !== "https:") {
+      // warn but try starting the camera anyways
+      console.warn(
+        "The camera stream is only accessible if the page is transferred via https."
+      );
+    }
+    this._active = true;
+    this._paused = false;
+    if (document.hidden) {
+      // camera will be started as soon as tab is in foreground
+      return Promise.resolve();
+    }
+    clearTimeout(this._offTimeout);
+    this._offTimeout = null;
+    if (this.$video.srcObject) {
+      // camera stream already/still set
+      this.$video.play();
+      return Promise.resolve();
+    }
+
+    let facingMode = this._preferredFacingMode;
+    return this._getCameraStream(facingMode, true)
+      .catch(() => {
+        // We (probably) don't have a camera of the requested facing mode
+        facingMode = facingMode === "environment" ? "user" : "environment";
+        return this._getCameraStream(); // throws if camera is not accessible (e.g. due to not https)
+      })
+      .then((stream) => {
+        // Try to determine the facing mode from the stream, otherwise use our guess. Note that the guess is not
+        // always accurate as Safari returns cameras of different facing mode, even for exact constraints.
+        facingMode = this._getFacingMode(stream) || facingMode;
+        this.$video.srcObject = stream;
+        this.$video.play();
+        this._setVideoMirror(facingMode);
+      })
+      .catch((e) => {
+        this._active = false;
+        throw e;
+      });
+  }
+
+  stop() {
+    this.pause();
+    this._active = false;
+  }
+
+  pause() {
+    this._paused = true;
+    if (!this._active) {
+      return;
+    }
+    this.$video.pause();
+    if (this._offTimeout) {
+      return;
+    }
+    this._offTimeout = setTimeout(() => {
+      const tracks = this.$video.srcObject
+        ? this.$video.srcObject.getTracks()
+        : [];
+      for (const track of tracks) {
+        track.stop(); //  note that this will also automatically turn the flashlight off
+      }
+      this.$video.srcObject = null;
+      this._offTimeout = null;
+    }, 300);
+  }
+
+  /* async */
+  static scanImage(
+    imageOrFileOrUrl,
+    sourceRect = null,
+    worker = null,
+    canvas = null,
+    fixedCanvasSize = false,
+    alsoTryWithoutSourceRect = false
+  ) {
+    let createdNewWorker = false;
+    let promise = new Promise((resolve, reject) => {
+      if (!worker) {
+        worker = new Worker(QrScanner.WORKER_PATH);
+        createdNewWorker = true;
+        worker.postMessage({ type: "inversionMode", data: "both" }); // scan inverted color qr codes too
+      }
+      let timeout, onMessage, onError;
+      onMessage = (event) => {
+        if (event.data.type !== "qrResult") {
+          return;
+        }
+        worker.removeEventListener("message", onMessage);
+        worker.removeEventListener("error", onError);
+        clearTimeout(timeout);
+        if (event.data.data !== null) {
+          resolve(event.data.data);
         } else {
-            this._onDecodeError = canvasSizeOrOnDecodeError;
+          reject(QrScanner.NO_QR_CODE_FOUND);
         }
+      };
+      onError = (e) => {
+        worker.removeEventListener("message", onMessage);
+        worker.removeEventListener("error", onError);
+        clearTimeout(timeout);
+        const errorMessage = !e ? "Unknown Error" : e.message || e;
+        reject("Scanner error: " + errorMessage);
+      };
+      worker.addEventListener("message", onMessage);
+      worker.addEventListener("error", onError);
+      timeout = setTimeout(() => onError("timeout"), 10000);
+      QrScanner._loadImage(imageOrFileOrUrl)
+        .then((image) => {
+          const imageData = QrScanner._getImageData(
+            image,
+            sourceRect,
+            canvas,
+            fixedCanvasSize
+          );
+          worker.postMessage(
+            {
+              type: "decode",
+              data: imageData,
+            },
+            [imageData.data.buffer]
+          );
+        })
+        .catch(onError);
+    });
 
-        this.$canvas.width = canvasSize;
-        this.$canvas.height = canvasSize;
-        this._sourceRect = {
-            x: 0,
-            y: 0,
-            width: canvasSize,
-            height: canvasSize
-        };
-
-        this._onPlay = this._onPlay.bind(this);
-        this._onVisibilityChange = this._onVisibilityChange.bind(this);
-
-        // Allow inline playback on iPhone instead of requiring full screen playback,
-        // see https://webkit.org/blog/6784/new-video-policies-for-ios/
-        this.$video.playsInline = true;
-        // Allow play() on iPhone without requiring a user gesture. Should not really be needed as camera stream
-        // includes no audio, but just to be safe.
-        this.$video.muted = true;
-        this.$video.disablePictureInPicture = true;
-        this.$video.addEventListener('play', this._onPlay);
-        document.addEventListener('visibilitychange', this._onVisibilityChange);
-
-        this._qrWorker = new Worker(QrScanner.WORKER_PATH);
+    if (sourceRect && alsoTryWithoutSourceRect) {
+      promise = promise.catch(() =>
+        QrScanner.scanImage(
+          imageOrFileOrUrl,
+          null,
+          worker,
+          canvas,
+          fixedCanvasSize
+        )
+      );
     }
 
-    /* async */
-    hasFlash() {
-        if (!('ImageCapture' in window)) {
-            return Promise.resolve(false);
-        }
+    promise = promise.finally(() => {
+      if (!createdNewWorker) return;
+      worker.postMessage({
+        type: "close",
+      });
+    });
 
-        const track = this.$video.srcObject ? this.$video.srcObject.getVideoTracks()[0] : null;
-        if (!track) {
-            return Promise.reject('Camera not started or not available');
-        }
+    return promise;
+  }
 
-        const imageCapture = new ImageCapture(track);
-        return imageCapture.getPhotoCapabilities()
-            .then((result) => {
-                return result.fillLightMode.includes('flash');
-            })
-            .catch((error) => {
-                console.warn(error);
-                return false;
-            });
+  setGrayscaleWeights(red, green, blue, useIntegerApproximation = true) {
+    this._qrWorker.postMessage({
+      type: "grayscaleWeights",
+      data: { red, green, blue, useIntegerApproximation },
+    });
+  }
+
+  setInversionMode(inversionMode) {
+    this._qrWorker.postMessage({
+      type: "inversionMode",
+      data: inversionMode,
+    });
+  }
+
+  _onPlay() {
+    this._updateSourceRect();
+    this._scanFrame();
+  }
+
+  _onVisibilityChange() {
+    if (document.hidden) {
+      this.pause();
+    } else if (this._active) {
+      this.start();
     }
+  }
 
-    isFlashOn() {
-      return this._flashOn;
-    }
+  _updateSourceRect() {
+    const smallestDimension = Math.min(
+      this.$video.videoWidth,
+      this.$video.videoHeight
+    );
+    const sourceRectSize = Math.round((2 / 3) * smallestDimension);
+    this._sourceRect.width = this._sourceRect.height = sourceRectSize;
+    this._sourceRect.x = (this.$video.videoWidth - sourceRectSize) / 2;
+    this._sourceRect.y = (this.$video.videoHeight - sourceRectSize) / 2;
+  }
 
-    /* async */
-    toggleFlash() {
-      return this._setFlash(!this._flashOn);
-    }
-
-    /* async */
-    turnFlashOff() {
-      return this._setFlash(false);
-    }
-
-    /* async */
-    turnFlashOn() {
-      return this._setFlash(true);
-    }
-
-    destroy() {
-        this.$video.removeEventListener('play', this._onPlay);
-        document.removeEventListener('visibilitychange', this._onVisibilityChange);
-
-        this.stop();
-        this._qrWorker.postMessage({
-            type: 'close'
-        });
-    }
-
-    /* async */
-    start() {
-        if (this._active && !this._paused) {
-            return Promise.resolve();
-        }
-        if (window.location.protocol !== 'https:') {
-            // warn but try starting the camera anyways
-            console.warn('The camera stream is only accessible if the page is transferred via https.');
-        }
-        this._active = true;
-        this._paused = false;
-        if (document.hidden) {
-            // camera will be started as soon as tab is in foreground
-            return Promise.resolve();
-        }
-        clearTimeout(this._offTimeout);
-        this._offTimeout = null;
-        if (this.$video.srcObject) {
-            // camera stream already/still set
-            this.$video.play();
-            return Promise.resolve();
-        }
-
-        let facingMode = this._preferredFacingMode;
-        return this._getCameraStream(facingMode, true)
-            .catch(() => {
-                // We (probably) don't have a camera of the requested facing mode
-                facingMode = facingMode === 'environment' ? 'user' : 'environment';
-                return this._getCameraStream(); // throws if camera is not accessible (e.g. due to not https)
-            })
-            .then(stream => {
-                // Try to determine the facing mode from the stream, otherwise use our guess. Note that the guess is not
-                // always accurate as Safari returns cameras of different facing mode, even for exact constraints.
-                facingMode = this._getFacingMode(stream) || facingMode;
-                this.$video.srcObject = stream;
-                this.$video.play();
-                this._setVideoMirror(facingMode);
-            })
-            .catch(e => {
-                this._active = false;
-                throw e;
-            });
-    }
-
-    stop() {
-        this.pause();
-        this._active = false;
-    }
-
-    pause() {
-        this._paused = true;
-        if (!this._active) {
-            return;
-        }
-        this.$video.pause();
-        if (this._offTimeout) {
-            return;
-        }
-        this._offTimeout = setTimeout(() => {
-            const tracks = this.$video.srcObject ? this.$video.srcObject.getTracks() : [];
-            for (const track of tracks) {
-                track.stop(); //  note that this will also automatically turn the flashlight off
-            }
-            this.$video.srcObject = null;
-            this._offTimeout = null;
-        }, 300);
-    }
-
-    /* async */
-    static scanImage(imageOrFileOrUrl, sourceRect=null, worker=null, canvas=null, fixedCanvasSize=false,
-                     alsoTryWithoutSourceRect=false) {
-        let createdNewWorker = false;
-        let promise = new Promise((resolve, reject) => {
-            if (!worker) {
-                worker = new Worker(QrScanner.WORKER_PATH);
-                createdNewWorker = true;
-                worker.postMessage({ type: 'inversionMode', data: 'both' }); // scan inverted color qr codes too
-            }
-            let timeout, onMessage, onError;
-            onMessage = event => {
-                if (event.data.type !== 'qrResult') {
-                    return;
-                }
-                worker.removeEventListener('message', onMessage);
-                worker.removeEventListener('error', onError);
-                clearTimeout(timeout);
-                if (event.data.data !== null) {
-                    resolve(event.data.data);
-                } else {
-                    reject(QrScanner.NO_QR_CODE_FOUND);
-                }
-            };
-            onError = (e) => {
-                worker.removeEventListener('message', onMessage);
-                worker.removeEventListener('error', onError);
-                clearTimeout(timeout);
-                const errorMessage = !e ? 'Unknown Error' : (e.message || e);
-                reject('Scanner error: ' + errorMessage);
-            };
-            worker.addEventListener('message', onMessage);
-            worker.addEventListener('error', onError);
-            timeout = setTimeout(() => onError('timeout'), 10000);
-            QrScanner._loadImage(imageOrFileOrUrl).then(image => {
-                const imageData = QrScanner._getImageData(image, sourceRect, canvas, fixedCanvasSize);
-                worker.postMessage({
-                    type: 'decode',
-                    data: imageData
-                }, [imageData.data.buffer]);
-            }).catch(onError);
-        });
-
-        if (sourceRect && alsoTryWithoutSourceRect) {
-            promise = promise.catch(() => QrScanner.scanImage(imageOrFileOrUrl, null, worker, canvas, fixedCanvasSize));
-        }
-
-        promise = promise.finally(() => {
-            if (!createdNewWorker) return;
-            worker.postMessage({
-                type: 'close'
-            });
-        });
-
-        return promise;
-    }
-
-    setGrayscaleWeights(red, green, blue, useIntegerApproximation = true) {
-        this._qrWorker.postMessage({
-            type: 'grayscaleWeights',
-            data: { red, green, blue, useIntegerApproximation }
-        });
-    }
-
-    setInversionMode(inversionMode) {
-        this._qrWorker.postMessage({
-            type: 'inversionMode',
-            data: inversionMode
-        });
-    }
-
-    _onPlay() {
-        this._updateSourceRect();
+  _scanFrame() {
+    if (!this._active || this.$video.paused || this.$video.ended) return false;
+    // using requestAnimationFrame to avoid scanning if tab is in background
+    requestAnimationFrame(() => {
+      if (this.$video.readyState <= 1) {
+        // Skip scans until the video is ready as drawImage() only works correctly on a video with readyState
+        // > 1, see https://developer.mozilla.org/en-US/docs/Web/API/CanvasRenderingContext2D/drawImage#Notes.
+        // This also avoids false positives for videos paused after a successful scan which remains visible on
+        // the canvas until the video is started again and ready.
         this._scanFrame();
-    }
+        return;
+      }
+      QrScanner.scanImage(
+        this.$video,
+        this._sourceRect,
+        this._qrWorker,
+        this.$canvas,
+        true
+      )
+        .then(this._onDecode, (error) => {
+          if (!this._active) return;
+          this._onDecodeError(error);
+        })
+        .then(() => this._scanFrame());
+    });
+  }
 
-    _onVisibilityChange() {
-        if (document.hidden) {
-            this.pause();
-        } else if (this._active) {
-            this.start();
-        }
-    }
+  _onDecodeError(error) {
+    // default error handler; can be overwritten in the constructor
+    if (error === QrScanner.NO_QR_CODE_FOUND) return;
+    console.log(error);
+  }
 
-    _updateSourceRect() {
-        const smallestDimension = Math.min(this.$video.videoWidth, this.$video.videoHeight);
-        const sourceRectSize = Math.round(2 / 3 * smallestDimension);
-        this._sourceRect.width = this._sourceRect.height = sourceRectSize;
-        this._sourceRect.x = (this.$video.videoWidth - sourceRectSize) / 2;
-        this._sourceRect.y = (this.$video.videoHeight - sourceRectSize) / 2;
-    }
+  _getCameraStream(facingMode, exact = false) {
+    const constraintsToTry = [
+      {
+        width: { min: 512 },
+      },
+      {
+        width: { min: 320 },
+      },
+      {},
+    ];
 
-    _scanFrame() {
-        if (!this._active || this.$video.paused || this.$video.ended) return false;
-        // using requestAnimationFrame to avoid scanning if tab is in background
-        requestAnimationFrame(() => {
-            if (this.$video.readyState <= 1) {
-                // Skip scans until the video is ready as drawImage() only works correctly on a video with readyState
-                // > 1, see https://developer.mozilla.org/en-US/docs/Web/API/CanvasRenderingContext2D/drawImage#Notes.
-                // This also avoids false positives for videos paused after a successful scan which remains visible on
-                // the canvas until the video is started again and ready.
-                this._scanFrame();
-                return;
-            }
-            QrScanner.scanImage(this.$video, this._sourceRect, this._qrWorker, this.$canvas, true)
-                .then(this._onDecode, (error) => {
-                    if (!this._active) return;
-                    this._onDecodeError(error);
-                })
-                .then(() => this._scanFrame());
+    if (facingMode) {
+      if (exact) {
+        facingMode = { exact: facingMode };
+      }
+      constraintsToTry.forEach(
+        (constraint) => (constraint.facingMode = facingMode)
+      );
+    }
+    return this._getMatchingCameraStream(constraintsToTry);
+  }
+
+  _getMatchingCameraStream(constraintsToTry) {
+    if (!navigator.mediaDevices || constraintsToTry.length === 0) {
+      return Promise.reject("Camera not found.");
+    }
+    return navigator.mediaDevices
+      .getUserMedia({
+        video: constraintsToTry.shift(),
+      })
+      .catch(() => this._getMatchingCameraStream(constraintsToTry));
+  }
+
+  /* async */
+  _setFlash(on) {
+    return this.hasFlash()
+      .then((hasFlash) => {
+        if (!hasFlash) return Promise.reject("No flash available");
+        // Note that the video track is guaranteed to exist at this point
+        return this.$video.srcObject.getVideoTracks()[0].applyConstraints({
+          advanced: [{ torch: on }],
         });
+      })
+      .then(() => (this._flashOn = on));
+  }
+
+  _setVideoMirror(facingMode) {
+    // in user facing mode mirror the video to make it easier for the user to position the QR code
+    const scaleFactor = facingMode === "user" ? -1 : 1;
+    this.$video.style.transform = "scaleX(" + scaleFactor + ")";
+  }
+
+  _getFacingMode(videoStream) {
+    const videoTrack = videoStream.getVideoTracks()[0];
+    if (!videoTrack) return null; // unknown
+    // inspired by https://github.com/JodusNodus/react-qr-reader/blob/master/src/getDeviceId.js#L13
+    return /rear|back|environment/i.test(videoTrack.label)
+      ? "environment"
+      : /front|user|face/i.test(videoTrack.label)
+      ? "user"
+      : null; // unknown
+  }
+
+  static _getImageData(
+    image,
+    sourceRect = null,
+    canvas = null,
+    fixedCanvasSize = false
+  ) {
+    canvas = canvas || document.createElement("canvas");
+    const sourceRectX = sourceRect && sourceRect.x ? sourceRect.x : 0;
+    const sourceRectY = sourceRect && sourceRect.y ? sourceRect.y : 0;
+    const sourceRectWidth =
+      sourceRect && sourceRect.width
+        ? sourceRect.width
+        : image.width || image.videoWidth;
+    const sourceRectHeight =
+      sourceRect && sourceRect.height
+        ? sourceRect.height
+        : image.height || image.videoHeight;
+    if (
+      !fixedCanvasSize &&
+      (canvas.width !== sourceRectWidth || canvas.height !== sourceRectHeight)
+    ) {
+      canvas.width = sourceRectWidth;
+      canvas.height = sourceRectHeight;
     }
+    const context = canvas.getContext("2d", { alpha: false });
+    context.imageSmoothingEnabled = false; // gives less blurry images
+    context.drawImage(
+      image,
+      sourceRectX,
+      sourceRectY,
+      sourceRectWidth,
+      sourceRectHeight,
+      0,
+      0,
+      canvas.width,
+      canvas.height
+    );
+    return context.getImageData(0, 0, canvas.width, canvas.height);
+  }
 
-    _onDecodeError(error) {
-        // default error handler; can be overwritten in the constructor
-        if (error === QrScanner.NO_QR_CODE_FOUND) return;
-        console.log(error);
-    }
-
-    _getCameraStream(facingMode, exact = false) {
-        const constraintsToTry = [{
-            width: { min: 1024 }
-        }, {
-            width: { min: 768 }
-        }, {}];
-
-        if (facingMode) {
-            if (exact) {
-                facingMode = { exact: facingMode };
-            }
-            constraintsToTry.forEach(constraint => constraint.facingMode = facingMode);
+  /* async */
+  static _loadImage(imageOrFileOrBlobOrUrl) {
+    if (
+      imageOrFileOrBlobOrUrl instanceof HTMLCanvasElement ||
+      imageOrFileOrBlobOrUrl instanceof HTMLVideoElement ||
+      (window.ImageBitmap &&
+        imageOrFileOrBlobOrUrl instanceof window.ImageBitmap) ||
+      (window.OffscreenCanvas &&
+        imageOrFileOrBlobOrUrl instanceof window.OffscreenCanvas)
+    ) {
+      return Promise.resolve(imageOrFileOrBlobOrUrl);
+    } else if (imageOrFileOrBlobOrUrl instanceof Image) {
+      return QrScanner._awaitImageLoad(imageOrFileOrBlobOrUrl).then(
+        () => imageOrFileOrBlobOrUrl
+      );
+    } else if (
+      imageOrFileOrBlobOrUrl instanceof File ||
+      imageOrFileOrBlobOrUrl instanceof Blob ||
+      imageOrFileOrBlobOrUrl instanceof URL ||
+      typeof imageOrFileOrBlobOrUrl === "string"
+    ) {
+      const image = new Image();
+      if (
+        imageOrFileOrBlobOrUrl instanceof File ||
+        imageOrFileOrBlobOrUrl instanceof Blob
+      ) {
+        image.src = URL.createObjectURL(imageOrFileOrBlobOrUrl);
+      } else {
+        image.src = imageOrFileOrBlobOrUrl;
+      }
+      return QrScanner._awaitImageLoad(image).then(() => {
+        if (
+          imageOrFileOrBlobOrUrl instanceof File ||
+          imageOrFileOrBlobOrUrl instanceof Blob
+        ) {
+          URL.revokeObjectURL(image.src);
         }
-        return this._getMatchingCameraStream(constraintsToTry);
+        return image;
+      });
+    } else {
+      return Promise.reject("Unsupported image type.");
     }
+  }
 
-    _getMatchingCameraStream(constraintsToTry) {
-        if (!navigator.mediaDevices || constraintsToTry.length === 0) {
-            return Promise.reject('Camera not found.');
-        }
-        return navigator.mediaDevices.getUserMedia({
-            video: constraintsToTry.shift()
-        }).catch(() => this._getMatchingCameraStream(constraintsToTry));
-    }
-
-    /* async */
-    _setFlash(on) {
-        return this.hasFlash().then((hasFlash) => {
-            if (!hasFlash) return Promise.reject('No flash available');
-            // Note that the video track is guaranteed to exist at this point
-            return this.$video.srcObject.getVideoTracks()[0].applyConstraints({
-                advanced: [{ torch: on }],
-            });
-        }).then(() => this._flashOn = on);
-    }
-
-    _setVideoMirror(facingMode) {
-        // in user facing mode mirror the video to make it easier for the user to position the QR code
-        const scaleFactor = facingMode==='user'? -1 : 1;
-        this.$video.style.transform = 'scaleX(' + scaleFactor + ')';
-    }
-
-    _getFacingMode(videoStream) {
-        const videoTrack = videoStream.getVideoTracks()[0];
-        if (!videoTrack) return null; // unknown
-        // inspired by https://github.com/JodusNodus/react-qr-reader/blob/master/src/getDeviceId.js#L13
-        return /rear|back|environment/i.test(videoTrack.label)
-            ? 'environment'
-            : /front|user|face/i.test(videoTrack.label)
-                ? 'user'
-                : null; // unknown
-    }
-
-    static _getImageData(image, sourceRect=null, canvas=null, fixedCanvasSize=false) {
-        canvas = canvas || document.createElement('canvas');
-        const sourceRectX = sourceRect && sourceRect.x? sourceRect.x : 0;
-        const sourceRectY = sourceRect && sourceRect.y? sourceRect.y : 0;
-        const sourceRectWidth = sourceRect && sourceRect.width? sourceRect.width : image.width || image.videoWidth;
-        const sourceRectHeight = sourceRect && sourceRect.height? sourceRect.height : image.height || image.videoHeight;
-        if (!fixedCanvasSize && (canvas.width !== sourceRectWidth || canvas.height !== sourceRectHeight)) {
-            canvas.width = sourceRectWidth;
-            canvas.height = sourceRectHeight;
-        }
-        const context = canvas.getContext('2d', { alpha: false });
-        context.imageSmoothingEnabled = false; // gives less blurry images
-        context.drawImage(image, sourceRectX, sourceRectY, sourceRectWidth, sourceRectHeight, 0, 0, canvas.width, canvas.height);
-        return context.getImageData(0, 0, canvas.width, canvas.height);
-    }
-
-    /* async */
-    static _loadImage(imageOrFileOrBlobOrUrl) {
-        if (imageOrFileOrBlobOrUrl instanceof HTMLCanvasElement || imageOrFileOrBlobOrUrl instanceof HTMLVideoElement
-            || window.ImageBitmap && imageOrFileOrBlobOrUrl instanceof window.ImageBitmap
-            || window.OffscreenCanvas && imageOrFileOrBlobOrUrl instanceof window.OffscreenCanvas) {
-            return Promise.resolve(imageOrFileOrBlobOrUrl);
-        } else if (imageOrFileOrBlobOrUrl instanceof Image) {
-            return QrScanner._awaitImageLoad(imageOrFileOrBlobOrUrl).then(() => imageOrFileOrBlobOrUrl);
-        } else if (imageOrFileOrBlobOrUrl instanceof File || imageOrFileOrBlobOrUrl instanceof Blob
-            || imageOrFileOrBlobOrUrl instanceof URL || typeof(imageOrFileOrBlobOrUrl)==='string') {
-            const image = new Image();
-            if (imageOrFileOrBlobOrUrl instanceof File || imageOrFileOrBlobOrUrl instanceof Blob) {
-                image.src = URL.createObjectURL(imageOrFileOrBlobOrUrl);
-            } else {
-                image.src = imageOrFileOrBlobOrUrl;
-            }
-            return QrScanner._awaitImageLoad(image).then(() => {
-                if (imageOrFileOrBlobOrUrl instanceof File || imageOrFileOrBlobOrUrl instanceof Blob) {
-                    URL.revokeObjectURL(image.src);
-                }
-                return image;
-            });
-        } else {
-            return Promise.reject('Unsupported image type.');
-        }
-    }
-
-    /* async */
-    static _awaitImageLoad(image) {
-        return new Promise((resolve, reject) => {
-            if (image.complete && image.naturalWidth!==0) {
-                // already loaded
-                resolve();
-            } else {
-                let onLoad, onError;
-                onLoad = () => {
-                    image.removeEventListener('load', onLoad);
-                    image.removeEventListener('error', onError);
-                    resolve();
-                };
-                onError = () => {
-                    image.removeEventListener('load', onLoad);
-                    image.removeEventListener('error', onError);
-                    reject('Image load error');
-                };
-                image.addEventListener('load', onLoad);
-                image.addEventListener('error', onError);
-            }
-        });
-    }
+  /* async */
+  static _awaitImageLoad(image) {
+    return new Promise((resolve, reject) => {
+      if (image.complete && image.naturalWidth !== 0) {
+        // already loaded
+        resolve();
+      } else {
+        let onLoad, onError;
+        onLoad = () => {
+          image.removeEventListener("load", onLoad);
+          image.removeEventListener("error", onError);
+          resolve();
+        };
+        onError = () => {
+          image.removeEventListener("load", onLoad);
+          image.removeEventListener("error", onError);
+          reject("Image load error");
+        };
+        image.addEventListener("load", onLoad);
+        image.addEventListener("error", onError);
+      }
+    });
+  }
 }
 QrScanner.DEFAULT_CANVAS_SIZE = 400;
-QrScanner.NO_QR_CODE_FOUND = 'No QR code found';
-QrScanner.WORKER_PATH = 'qr-scanner-worker.min.js';
+QrScanner.NO_QR_CODE_FOUND = "No QR code found";
+QrScanner.WORKER_PATH = "qr-scanner-worker.min.js";
