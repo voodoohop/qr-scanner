@@ -40,7 +40,7 @@ function decode(data) {
     });
     self.postMessage({
         type: 'qrResult',
-        data: result? result.data : null,
+        data: result,
     });
 }
 
