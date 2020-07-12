@@ -343,10 +343,12 @@ export default class QrScanner {
   _getCameraStream(facingMode, exact = false) {
     const constraintsToTry = [
       {
-        width: { min: 512 },
+        width: { min: 512, max: 640 },
+        height: { min: 480, max: 640 },
       },
       {
-        width: { min: 320 },
+        width: { min: 320, max: 640 },
+        height: { min: 240, max: 640 },
       },
       {},
     ];
